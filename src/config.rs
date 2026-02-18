@@ -34,11 +34,23 @@ pub struct GatewayConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackConfig {
     pub enabled: bool,
+    #[serde(default)]
+    pub mode: SlackMode,
     pub bot_token: Option<String>,
     pub signing_secret: Option<String>,
     pub app_token: Option<String>,
     pub default_channel: Option<String>,
     pub bot_user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SlackMode {
+    #[default]
+    #[serde(alias = "http")]
+    EventsApi,
+    #[serde(alias = "socket_mode")]
+    Socket,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +93,7 @@ impl Default for AppConfig {
             },
             slack: SlackConfig {
                 enabled: false,
+                mode: SlackMode::EventsApi,
                 bot_token: None,
                 signing_secret: None,
                 app_token: None,
@@ -157,12 +170,16 @@ pub async fn save_config(path: &Path, cfg: &AppConfig) -> Result<()> {
 
 pub fn set_config_path_value(cfg: &mut AppConfig, dotted_path: &str, value: &str) -> Result<()> {
     let mut root: Value = serde_json::to_value(&*cfg)?;
-    let parts: Vec<&str> = dotted_path.split('.').filter(|part| !part.is_empty()).collect();
+    let parts: Vec<&str> = dotted_path
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .collect();
     if parts.is_empty() {
         bail!("path must not be empty");
     }
 
-    let parsed_value: Value = serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
+    let parsed_value: Value =
+        serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
 
     let mut cursor = &mut root;
     for key in &parts[..parts.len() - 1] {

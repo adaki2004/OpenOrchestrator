@@ -80,11 +80,13 @@ Gateway route: `POST /slack/events`
 Configure Slack app:
 
 - Bot token (`xoxb-...`)
-- Signing secret
+- Choose mode:
+  - Events API webhook mode: requires Signing secret + webhook URL
+  - Socket Mode: requires App token (`xapp-...`), no webhook signature needed
 - Event webhook URL (your gateway URL + `/slack/events`)
 - Bot events: at least `app_mention` and message events
 
-OpenOrchestrator verifies Slack signatures if signing secret is configured.
+OpenOrchestrator verifies Slack signatures in Events API mode and supports Slack Socket Mode for local setups without inbound webhooks.
 
 ## Config commands
 

@@ -1,7 +1,7 @@
 use crate::codex::CodexRunner;
-use crate::config::{AppConfig, default_config_path, load_or_default, save_config};
-use anyhow::{Context, Result};
-use dialoguer::{Confirm, Input, Password, theme::ColorfulTheme};
+use crate::config::{AppConfig, SlackMode, default_config_path, load_or_default, save_config};
+use anyhow::{Context, Result, bail};
+use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -69,7 +69,22 @@ pub async fn run_onboarding(path: Option<PathBuf>) -> Result<PathBuf> {
     cfg.slack.enabled = slack_enabled;
 
     if slack_enabled {
+        let slack_mode_index = Select::with_theme(&theme)
+            .with_prompt("Slack delivery mode")
+            .items(&["Events API webhook", "Socket Mode"])
+            .default(match cfg.slack.mode {
+                SlackMode::EventsApi => 0,
+                SlackMode::Socket => 1,
+            })
+            .interact()?;
+        cfg.slack.mode = if slack_mode_index == 1 {
+            SlackMode::Socket
+        } else {
+            SlackMode::EventsApi
+        };
+
         let existing_bot = cfg.slack.bot_token.clone().unwrap_or_default();
+        let existing_app = cfg.slack.app_token.clone().unwrap_or_default();
         let bot_token = Password::with_theme(&theme)
             .with_prompt("Slack bot token (xoxb-...)")
             .allow_empty_password(true)
@@ -77,13 +92,21 @@ pub async fn run_onboarding(path: Option<PathBuf>) -> Result<PathBuf> {
             .interact()?;
 
         let signing_secret = Password::with_theme(&theme)
-            .with_prompt("Slack signing secret (recommended)")
+            .with_prompt(match cfg.slack.mode {
+                SlackMode::EventsApi => "Slack signing secret (required for Events API mode)",
+                SlackMode::Socket => "Slack signing secret (optional in Socket Mode)",
+            })
             .allow_empty_password(true)
             .with_confirmation("Confirm signing secret", "Values do not match")
             .interact()?;
 
         let app_token = Password::with_theme(&theme)
-            .with_prompt("Slack app token (xapp-..., optional for future socket mode)")
+            .with_prompt(match cfg.slack.mode {
+                SlackMode::EventsApi => {
+                    "Slack app token (xapp-..., optional unless using Socket Mode)"
+                }
+                SlackMode::Socket => "Slack app token (xapp-..., required for Socket Mode)",
+            })
             .allow_empty_password(true)
             .with_confirmation("Confirm app token", "Values do not match")
             .interact()?;
@@ -101,8 +124,23 @@ pub async fn run_onboarding(path: Option<PathBuf>) -> Result<PathBuf> {
         .filter(|value| !value.trim().is_empty());
 
         cfg.slack.signing_secret = Some(signing_secret).filter(|value| !value.trim().is_empty());
-        cfg.slack.app_token = Some(app_token).filter(|value| !value.trim().is_empty());
+        cfg.slack.app_token = Some(if app_token.trim().is_empty() {
+            existing_app
+        } else {
+            app_token
+        })
+        .filter(|value| !value.trim().is_empty());
         cfg.slack.default_channel = Some(default_channel).filter(|value| !value.trim().is_empty());
+
+        if cfg.slack.bot_token.is_none() {
+            bail!("Slack bot token is required when Slack integration is enabled");
+        }
+        if cfg.slack.mode == SlackMode::EventsApi && cfg.slack.signing_secret.is_none() {
+            bail!("Slack signing secret is required in Events API mode");
+        }
+        if cfg.slack.mode == SlackMode::Socket && cfg.slack.app_token.is_none() {
+            bail!("Slack app token is required in Socket Mode");
+        }
     } else {
         cfg.slack.bot_token = None;
         cfg.slack.signing_secret = None;
