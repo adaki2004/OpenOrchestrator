@@ -109,8 +109,9 @@ Acceptance:
 
 ### FR-6 Sub-agent orchestration
 
-- `/spawn <agent_id> | <soul>`
+- `/spawn <agent_id> | <soul> | <workspace_path?>`
 - `/delegate <agent_id> <task>`
+- `<agent_id> run <task>`
 
 Acceptance:
 
@@ -148,13 +149,14 @@ Acceptance:
 
 - `/help`
 - `/agents`
-- `/spawn <agent_id> | <soul prompt>`
+- `/spawn <agent_id> | <soul prompt> | <workspace_path?>`
 - `/tasks`
 - `/task add <title>`
 - `/task done <id>`
 - `/remember <note>`
 - `/mem <query>`
 - `/delegate <agent_id> <task>`
+- `<agent_id> run <task>`
 
 ## 10) Architecture overview
 

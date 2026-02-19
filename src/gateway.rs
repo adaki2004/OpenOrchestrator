@@ -1,4 +1,4 @@
-use crate::config::SlackMode;
+use crate::config::{SlackMode, normalize_workspace_binding, resolve_path};
 use crate::orchestrator::{IncomingMessage, Orchestrator};
 use crate::state::TaskItem;
 use anyhow::{Context, Result, bail};
@@ -15,9 +15,12 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::fs;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
@@ -28,6 +31,9 @@ type HmacSha256 = Hmac<Sha256>;
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 const MAX_CHAT_TEXT_CHARS: usize = 16_000;
 const MAX_CHAT_FIELD_CHARS: usize = 128;
+const MAX_SLACK_ATTACHMENTS: usize = 5;
+const MAX_SLACK_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_SLACK_OUTPUT_UPLOADS: usize = 3;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -63,6 +69,13 @@ struct GatewayState {
     started_at: Instant,
     http_client: Client,
     slack: SlackRuntime,
+}
+
+#[derive(Debug, Clone)]
+struct SlackAttachment {
+    name: String,
+    download_url: String,
+    size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -378,13 +391,6 @@ async fn process_slack_event(state: GatewayState, payload: Value) -> Result<()> 
         return Ok(());
     }
 
-    let cleaned_text = clean_slack_mention(&state.slack, &text_raw)
-        .trim()
-        .to_string();
-    if cleaned_text.is_empty() {
-        return Ok(());
-    }
-
     let thread_ts = event
         .get("thread_ts")
         .and_then(Value::as_str)
@@ -395,6 +401,27 @@ async fn process_slack_event(state: GatewayState, payload: Value) -> Result<()> 
         channel,
         thread_ts.clone().unwrap_or_else(|| "root".to_string())
     );
+
+    let mut cleaned_text = clean_slack_mention(&state.slack, &text_raw)
+        .trim()
+        .to_string();
+    match build_slack_attachment_context(&state, &event, &session).await {
+        Ok(Some(context)) => {
+            if !cleaned_text.is_empty() {
+                cleaned_text.push_str("\n\n");
+            }
+            cleaned_text.push_str(&context);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            warn!(error = %err, "failed to process Slack attachments");
+        }
+    }
+
+    let cleaned_text = cleaned_text.trim().to_string();
+    if cleaned_text.is_empty() {
+        return Ok(());
+    }
 
     let reply = state
         .orchestrator
@@ -417,6 +444,19 @@ async fn process_slack_event(state: GatewayState, payload: Value) -> Result<()> 
             state.slack.default_channel.as_deref(),
         )
         .await?;
+
+        if let Err(err) = upload_reply_output_files_to_slack(
+            &state,
+            token,
+            &channel,
+            thread_ts.as_deref(),
+            state.slack.default_channel.as_deref(),
+            &reply.reply,
+        )
+        .await
+        {
+            warn!(error = %err, "failed uploading reply output files to Slack");
+        }
     }
 
     Ok(())
@@ -453,6 +493,544 @@ fn clean_slack_mention(slack: &SlackRuntime, text: &str) -> String {
     text.to_string()
 }
 
+async fn build_slack_attachment_context(
+    state: &GatewayState,
+    event: &Value,
+    session: &str,
+) -> Result<Option<String>> {
+    let token = match state.slack.bot_token.as_deref() {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => return Ok(None),
+    };
+
+    let attachments = extract_slack_attachments(event);
+    if attachments.is_empty() {
+        return Ok(None);
+    }
+
+    let workspaces = collect_agent_workspaces(state).await;
+    let session_component = sanitize_path_component(session, "slack-session");
+    let mut lines = vec!["Attached files saved to agent workspaces:".to_string()];
+    let mut saved_count = 0usize;
+    let mut index = 0usize;
+
+    for attachment in attachments.into_iter().take(MAX_SLACK_ATTACHMENTS) {
+        index += 1;
+        if attachment
+            .size_bytes
+            .is_some_and(|size| size > MAX_SLACK_ATTACHMENT_BYTES)
+        {
+            lines.push(format!(
+                "- {} (skipped: file is larger than {} bytes)",
+                attachment.name, MAX_SLACK_ATTACHMENT_BYTES
+            ));
+            continue;
+        }
+
+        let bytes =
+            match download_slack_attachment(&state.http_client, token, &attachment.download_url)
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    lines.push(format!("- {} (download failed: {})", attachment.name, err));
+                    continue;
+                }
+            };
+
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SLACK_ATTACHMENT_BYTES {
+            lines.push(format!(
+                "- {} (skipped: downloaded payload exceeded {} bytes)",
+                attachment.name, MAX_SLACK_ATTACHMENT_BYTES
+            ));
+            continue;
+        }
+
+        let safe_name = sanitize_file_name(&attachment.name);
+        let relative_path = PathBuf::from(".openorchestrator")
+            .join("inbox")
+            .join(&session_component)
+            .join(format!("{:02}-{}", index, safe_name));
+
+        let mut persisted_to_workspace = false;
+        for workspace in &workspaces {
+            match write_attachment_bytes(workspace, &relative_path, &bytes).await {
+                Ok(()) => {
+                    persisted_to_workspace = true;
+                }
+                Err(err) => {
+                    warn!(
+                        workspace = %workspace.display(),
+                        attachment = %attachment.name,
+                        error = %err,
+                        "failed writing Slack attachment to workspace"
+                    );
+                }
+            }
+        }
+
+        if persisted_to_workspace {
+            saved_count += 1;
+            lines.push(format!(
+                "- {} -> {}",
+                attachment.name,
+                relative_path.display()
+            ));
+        } else {
+            lines.push(format!(
+                "- {} (save failed for all workspaces)",
+                attachment.name
+            ));
+        }
+    }
+
+    if saved_count == 0 {
+        return Ok(None);
+    }
+
+    lines.push("Use the saved local paths when running scripts.".to_string());
+    Ok(Some(lines.join("\n")))
+}
+
+fn extract_slack_attachments(event: &Value) -> Vec<SlackAttachment> {
+    let mut output = Vec::new();
+    let mut seen = HashSet::new();
+
+    let Some(files) = event.get("files").and_then(Value::as_array) else {
+        return output;
+    };
+
+    for item in files {
+        let download_url = item
+            .get("url_private_download")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("url_private").and_then(Value::as_str))
+            .unwrap_or_default()
+            .trim();
+        if download_url.is_empty() {
+            continue;
+        }
+
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let dedupe_key = id.clone().unwrap_or_else(|| download_url.to_string());
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("attachment.bin")
+            .to_string();
+        let size_bytes = item.get("size").and_then(Value::as_u64);
+
+        output.push(SlackAttachment {
+            name,
+            download_url: download_url.to_string(),
+            size_bytes,
+        });
+    }
+
+    output
+}
+
+async fn collect_agent_workspaces(state: &GatewayState) -> Vec<PathBuf> {
+    let config_handle = state.orchestrator.config_handle();
+    let cfg = config_handle.read().await;
+    let mut output = Vec::new();
+    let mut seen = HashSet::new();
+
+    let normalized_brain_workspace =
+        normalize_workspace_binding(&cfg.brain.workspace, &cfg.brain.workspace);
+    let default_workspace = resolve_path(&normalized_brain_workspace);
+
+    for agent in &cfg.agents {
+        let workspace = agent
+            .workspace
+            .as_deref()
+            .map(|value| normalize_workspace_binding(value, &cfg.brain.workspace))
+            .map(|value| resolve_path(&value))
+            .unwrap_or_else(|| default_workspace.clone());
+        let key = workspace.to_string_lossy().to_string();
+        if seen.insert(key) {
+            output.push(workspace);
+        }
+    }
+
+    if output.is_empty() {
+        output.push(default_workspace);
+    }
+
+    output
+}
+
+async fn download_slack_attachment(client: &Client, token: &str, url: &str) -> Result<Vec<u8>> {
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("failed calling Slack file URL")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        bail!("Slack file download failed with status {}", status);
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .context("failed reading Slack file bytes")?;
+    Ok(bytes.to_vec())
+}
+
+async fn write_attachment_bytes(
+    workspace: &Path,
+    relative_path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    let full_path = workspace.join(relative_path);
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed creating attachment parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fs::write(&full_path, bytes)
+        .await
+        .with_context(|| format!("failed writing attachment {}", full_path.display()))?;
+    Ok(())
+}
+
+fn sanitize_file_name(value: &str) -> String {
+    let sanitized = sanitize_path_component(value, "attachment.bin");
+    let mut output = sanitized
+        .chars()
+        .take(96)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if output.is_empty() {
+        output = "attachment.bin".to_string();
+    }
+    output
+}
+
+fn sanitize_path_component(value: &str, fallback: &str) -> String {
+    let mut output = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+
+    output = output.trim_matches('.').trim_matches('-').to_string();
+    if output.is_empty() {
+        fallback.to_string()
+    } else {
+        output
+    }
+}
+
+fn resolve_slack_target_channel(channel: &str, default_channel: Option<&str>) -> String {
+    if channel.trim().is_empty() {
+        default_channel.unwrap_or("").trim().to_string()
+    } else {
+        channel.trim().to_string()
+    }
+}
+
+fn extract_slack_output_paths(reply_text: &str) -> Vec<PathBuf> {
+    let mut output = Vec::new();
+    let mut seen = HashSet::new();
+
+    for token in reply_text.split_whitespace() {
+        let Some(candidate) = extract_slack_output_path_token(token) else {
+            continue;
+        };
+
+        let key = candidate.to_string();
+        if seen.insert(key.clone()) {
+            output.push(PathBuf::from(key));
+        }
+    }
+
+    output
+}
+
+fn extract_slack_output_path_token(token: &str) -> Option<String> {
+    let token = token
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '<' | '>'
+            )
+        })
+        .trim_end_matches(|ch: char| ch == '.' || ch == '-');
+
+    if token.is_empty() {
+        return None;
+    }
+
+    if token.contains("://") {
+        return None;
+    }
+
+    if let Some(outbox_idx) = token.find("/.openorchestrator/outbox/") {
+        let absolute_start = token.find('/').unwrap_or(outbox_idx);
+        return Some(token[absolute_start..].to_string());
+    }
+
+    if let Some(relative_start) = token.find(".openorchestrator/outbox/") {
+        return Some(token[relative_start..].to_string());
+    }
+
+    None
+}
+
+fn candidate_output_upload_paths(path: &Path, workspace_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut output = Vec::new();
+    let mut seen = HashSet::new();
+
+    if path.is_absolute() {
+        let key = path.to_string_lossy().to_string();
+        if seen.insert(key) {
+            output.push(path.to_path_buf());
+        }
+        return output;
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join(path);
+        let key = candidate.to_string_lossy().to_string();
+        if seen.insert(key) {
+            output.push(candidate);
+        }
+    }
+
+    for workspace in workspace_roots {
+        let candidate = workspace.join(path);
+        let key = candidate.to_string_lossy().to_string();
+        if seen.insert(key) {
+            output.push(candidate);
+        }
+    }
+
+    output
+}
+
+async fn resolve_output_path_for_upload(
+    path: &Path,
+    workspace_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    for candidate in candidate_output_upload_paths(path, workspace_roots) {
+        match fs::metadata(&candidate).await {
+            Ok(metadata) if metadata.is_file() => return Some(candidate),
+            _ => {}
+        }
+    }
+    None
+}
+
+async fn upload_reply_output_files_to_slack(
+    state: &GatewayState,
+    token: &str,
+    channel: &str,
+    thread_ts: Option<&str>,
+    default_channel: Option<&str>,
+    reply_text: &str,
+) -> Result<()> {
+    let target_channel = resolve_slack_target_channel(channel, default_channel);
+    if target_channel.is_empty() {
+        return Ok(());
+    }
+
+    let output_paths = extract_slack_output_paths(reply_text);
+    if output_paths.is_empty() {
+        return Ok(());
+    }
+
+    let workspace_roots = collect_agent_workspaces(state).await;
+
+    for path in output_paths.into_iter().take(MAX_SLACK_OUTPUT_UPLOADS) {
+        let Some(resolved_path) = resolve_output_path_for_upload(&path, &workspace_roots).await
+        else {
+            warn!(
+                path = %path.display(),
+                "could not resolve output file path for Slack upload"
+            );
+            continue;
+        };
+
+        if let Err(err) = upload_slack_file_from_path(
+            &state.http_client,
+            token,
+            &target_channel,
+            thread_ts,
+            &resolved_path,
+        )
+        .await
+        {
+            warn!(
+                path = %resolved_path.display(),
+                error = %err,
+                "failed uploading output file to Slack"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn upload_slack_file_from_path(
+    client: &Client,
+    token: &str,
+    channel: &str,
+    thread_ts: Option<&str>,
+    path: &Path,
+) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .await
+        .with_context(|| format!("failed reading output file metadata {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("output path is not a file: {}", path.display());
+    }
+
+    if metadata.len() > MAX_SLACK_ATTACHMENT_BYTES {
+        bail!(
+            "output file {} exceeds max upload size {} bytes",
+            path.display(),
+            MAX_SLACK_ATTACHMENT_BYTES
+        );
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("output file has invalid utf-8 name")?;
+    let bytes = fs::read(path)
+        .await
+        .with_context(|| format!("failed reading output file {}", path.display()))?;
+
+    upload_slack_file_bytes(client, token, channel, thread_ts, file_name, bytes).await
+}
+
+async fn upload_slack_file_bytes(
+    client: &Client,
+    token: &str,
+    channel: &str,
+    thread_ts: Option<&str>,
+    file_name: &str,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    let upload_init = client
+        .post("https://slack.com/api/files.getUploadURLExternal")
+        .bearer_auth(token)
+        .form(&[
+            ("filename", file_name.to_string()),
+            ("length", bytes.len().to_string()),
+        ])
+        .send()
+        .await
+        .context("failed calling Slack files.getUploadURLExternal")?;
+
+    let init_status = upload_init.status();
+    let init_body: Value = upload_init
+        .json()
+        .await
+        .context("failed parsing Slack files.getUploadURLExternal response")?;
+    if !init_status.is_success() {
+        bail!(
+            "Slack files.getUploadURLExternal HTTP {}: {}",
+            init_status,
+            init_body
+        );
+    }
+    if !init_body
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("Slack files.getUploadURLExternal failed: {}", init_body);
+    }
+
+    let upload_url = init_body
+        .get("upload_url")
+        .and_then(Value::as_str)
+        .context("Slack files.getUploadURLExternal missing upload_url")?;
+    let file_id = init_body
+        .get("file_id")
+        .and_then(Value::as_str)
+        .context("Slack files.getUploadURLExternal missing file_id")?;
+
+    let upload_response = client
+        .post(upload_url)
+        .header("content-type", "application/octet-stream")
+        .body(bytes)
+        .send()
+        .await
+        .context("failed uploading file bytes to Slack upload_url")?;
+    if !upload_response.status().is_success() {
+        bail!(
+            "Slack upload_url returned status {}",
+            upload_response.status()
+        );
+    }
+
+    let mut complete_payload = json!({
+        "files": [{ "id": file_id, "title": file_name }],
+        "channel_id": channel,
+    });
+    if let Some(thread_ts) = thread_ts.filter(|value| !value.trim().is_empty()) {
+        complete_payload["thread_ts"] = Value::String(thread_ts.to_string());
+    }
+
+    let complete_response = client
+        .post("https://slack.com/api/files.completeUploadExternal")
+        .bearer_auth(token)
+        .json(&complete_payload)
+        .send()
+        .await
+        .context("failed calling Slack files.completeUploadExternal")?;
+
+    let complete_status = complete_response.status();
+    let complete_body: Value = complete_response
+        .json()
+        .await
+        .context("failed parsing Slack files.completeUploadExternal response")?;
+    if !complete_status.is_success() {
+        bail!(
+            "Slack files.completeUploadExternal HTTP {}: {}",
+            complete_status,
+            complete_body
+        );
+    }
+    if !complete_body
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!(
+            "Slack files.completeUploadExternal failed: {}",
+            complete_body
+        );
+    }
+
+    Ok(())
+}
+
 async fn send_slack_message(
     client: &Client,
     token: &str,
@@ -461,13 +1039,8 @@ async fn send_slack_message(
     thread_ts: Option<&str>,
     default_channel: Option<&str>,
 ) -> Result<()> {
-    let target_channel = if channel.trim().is_empty() {
-        default_channel.unwrap_or("")
-    } else {
-        channel
-    };
-
-    if target_channel.trim().is_empty() {
+    let target_channel = resolve_slack_target_channel(channel, default_channel);
+    if target_channel.is_empty() {
         warn!("Slack reply skipped because no channel was available");
         return Ok(());
     }
@@ -944,6 +1517,108 @@ mod tests {
             HeaderValue::from_static("not-a-number"),
         );
         assert!(!verify_slack_signature(secret, &malformed_headers, body));
+    }
+
+    #[test]
+    fn extract_slack_attachments_parses_and_deduplicates_files() {
+        let event = json!({
+            "files": [
+                {
+                    "id": "F01",
+                    "name": "posting-hours.csv",
+                    "url_private_download": "https://files.example/F01",
+                    "size": 42
+                },
+                {
+                    "id": "F01",
+                    "name": "posting-hours-duplicate.csv",
+                    "url_private_download": "https://files.example/F01-duplicate",
+                    "size": 42
+                },
+                {
+                    "id": "F02",
+                    "url_private": "https://files.example/F02"
+                },
+                {
+                    "id": "F03",
+                    "name": "missing-url"
+                }
+            ]
+        });
+
+        let attachments = extract_slack_attachments(&event);
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].name, "posting-hours.csv");
+        assert_eq!(attachments[0].download_url, "https://files.example/F01");
+        assert_eq!(attachments[1].name, "attachment.bin");
+        assert_eq!(attachments[1].download_url, "https://files.example/F02");
+    }
+
+    #[test]
+    fn sanitize_path_component_and_file_name_are_safe() {
+        assert_eq!(
+            sanitize_path_component("../unsafe file", "fallback"),
+            "unsafe-file"
+        );
+        assert_eq!(sanitize_path_component("!!!", "fallback"), "fallback");
+        assert_eq!(sanitize_file_name(".."), "attachment.bin");
+    }
+
+    #[test]
+    fn extract_slack_output_paths_uses_outbox_only_and_deduplicates() {
+        let reply = r#"delegate:openclawd_1
+`posting-hours` run completed on the attached file.
+
+- `output`: `/Users/keszeyd/work/.openorchestrator/outbox/report_1.xlsx`
+- `log`: `/Users/keszeyd/work/.openorchestrator/logs/report_1.log`
+- duplicate: `/Users/keszeyd/work/.openorchestrator/outbox/report_1.xlsx`
+"#;
+
+        let paths = extract_slack_output_paths(reply);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0],
+            PathBuf::from("/Users/keszeyd/work/.openorchestrator/outbox/report_1.xlsx")
+        );
+    }
+
+    #[test]
+    fn extract_slack_output_paths_trims_wrapping_punctuation() {
+        let reply = "output=/Users/keszeyd/work/.openorchestrator/outbox/report_2.xlsx,";
+        let paths = extract_slack_output_paths(reply);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0],
+            PathBuf::from("/Users/keszeyd/work/.openorchestrator/outbox/report_2.xlsx")
+        );
+    }
+
+    #[test]
+    fn extract_slack_output_paths_supports_relative_outbox_paths() {
+        let reply = "artifact=`.openorchestrator/outbox/report_3.xlsx`";
+        let paths = extract_slack_output_paths(reply);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0],
+            PathBuf::from(".openorchestrator/outbox/report_3.xlsx")
+        );
+    }
+
+    #[test]
+    fn candidate_output_upload_paths_includes_workspace_joins_for_relative_paths() {
+        let relative = Path::new(".openorchestrator/outbox/report_4.xlsx");
+        let workspaces = vec![
+            PathBuf::from("/tmp/workspace-a"),
+            PathBuf::from("/tmp/workspace-b"),
+        ];
+        let candidates = candidate_output_upload_paths(relative, &workspaces);
+
+        assert!(candidates.contains(&PathBuf::from(
+            "/tmp/workspace-a/.openorchestrator/outbox/report_4.xlsx"
+        )));
+        assert!(candidates.contains(&PathBuf::from(
+            "/tmp/workspace-b/.openorchestrator/outbox/report_4.xlsx"
+        )));
     }
 
     fn build_signed_slack_headers(secret: &str, timestamp: &str, body: &[u8]) -> HeaderMap {

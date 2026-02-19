@@ -40,6 +40,16 @@ This writes config to:
 cargo run -- gateway run
 ```
 
+Codex sandbox override (for browser automation workflows):
+
+```bash
+# Keep sandbox, but choose mode (read-only|workspace-write|danger-full-access)
+OPENORCHESTRATOR_CODEX_SANDBOX=danger-full-access cargo run -- gateway run
+
+# Fully bypass Codex approvals+sandbox (only on trusted local hosts)
+OPENORCHESTRATOR_CODEX_BYPASS_SANDBOX=1 cargo run -- gateway run
+```
+
 Health check:
 
 ```bash
@@ -65,13 +75,25 @@ Everything else is sent to OpenOrchestrator (including agent/task commands).
 
 - `/help`
 - `/agents`
-- `/spawn <agent_id> | <soul prompt>`
+- `/spawn <agent_id> | <soul prompt> | <workspace_path?>`
 - `/tasks`
 - `/task add <title>`
 - `/task done <id>`
 - `/remember <note>`
 - `/mem <query>`
 - `/delegate <agent_id> <task>`
+- `<agent_id> run <task>` (natural delegation shortcut)
+
+Workspace compatibility:
+
+- legacy agent workspaces under `~/.openclaw/workspace/...` are remapped to `brain.workspace/...` at runtime
+
+Slack attachment behavior:
+
+- attached Slack files are downloaded with the bot token
+- files are saved to each agent workspace under `.openorchestrator/inbox/<session>/...`
+- those local paths are appended to the prompt so delegated runs can use them
+- delegated run replies that include `.openorchestrator/outbox/...` paths are auto-uploaded back into the same Slack thread (best-effort)
 
 ## Slack integration (Events API)
 

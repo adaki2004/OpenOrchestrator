@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tracing::warn;
 
 const DEFAULT_GATEWAY_HOST: &str = "127.0.0.1";
 const DEFAULT_GATEWAY_PORT: u16 = 3769;
+const LEGACY_OPENCLAW_WORKSPACE_SEGMENT: &str = ".openclaw/workspace/";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -147,6 +149,20 @@ pub async fn load_config(path: &Path) -> Result<AppConfig> {
     Ok(cfg)
 }
 
+pub async fn load_config_with_migration(path: &Path) -> Result<AppConfig> {
+    let mut cfg = load_config(path).await?;
+    if migrate_legacy_openclaw_workspace_bindings(&mut cfg) {
+        if let Err(err) = save_config(path, &cfg).await {
+            warn!(
+                config_path = %path.display(),
+                error = %err,
+                "failed to persist migrated workspace bindings; continuing with in-memory config"
+            );
+        }
+    }
+    Ok(cfg)
+}
+
 pub async fn load_or_default(path: &Path) -> Result<AppConfig> {
     if path.exists() {
         load_config(path).await
@@ -166,6 +182,81 @@ pub async fn save_config(path: &Path, cfg: &AppConfig) -> Result<()> {
         .await
         .with_context(|| format!("failed writing config {}", path.display()))?;
     Ok(())
+}
+
+pub fn migrate_legacy_openclaw_workspace_bindings(cfg: &mut AppConfig) -> bool {
+    let mut changed = false;
+    let brain_workspace = cfg.brain.workspace.clone();
+
+    for agent in &mut cfg.agents {
+        let Some(original_workspace) = agent.workspace.clone() else {
+            continue;
+        };
+        if !is_legacy_openclaw_workspace(&original_workspace) {
+            continue;
+        }
+
+        let normalized_workspace =
+            normalize_workspace_binding(&original_workspace, &brain_workspace);
+        if normalized_workspace == original_workspace {
+            continue;
+        }
+
+        agent.workspace = Some(normalized_workspace.clone());
+        if agent.soul.contains(&original_workspace) {
+            agent.soul = agent
+                .soul
+                .replace(&original_workspace, &normalized_workspace);
+        }
+        changed = true;
+    }
+
+    changed
+}
+
+pub fn normalize_workspace_binding(workspace: &str, brain_workspace: &str) -> String {
+    let Some(suffix) = legacy_openclaw_workspace_suffix(workspace) else {
+        return workspace.to_string();
+    };
+
+    let root = resolve_path(brain_workspace);
+    if suffix.is_empty() {
+        return root.to_string_lossy().to_string();
+    }
+    root.join(suffix).to_string_lossy().to_string()
+}
+
+fn is_legacy_openclaw_workspace(workspace: &str) -> bool {
+    legacy_openclaw_workspace_suffix(workspace).is_some()
+}
+
+fn legacy_openclaw_workspace_suffix(workspace: &str) -> Option<&str> {
+    let trimmed = workspace.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(value) = trimmed.strip_prefix("~/.openclaw/workspace/") {
+        return Some(value);
+    }
+    if trimmed == "~/.openclaw/workspace" {
+        return Some("");
+    }
+
+    if let Some(value) = trimmed.strip_prefix(LEGACY_OPENCLAW_WORKSPACE_SEGMENT) {
+        return Some(value);
+    }
+    if trimmed == ".openclaw/workspace" {
+        return Some("");
+    }
+
+    let marker = format!("/{}", LEGACY_OPENCLAW_WORKSPACE_SEGMENT);
+    if let Some(position) = trimmed.find(&marker) {
+        let start = position + marker.len();
+        return Some(&trimmed[start..]);
+    }
+
+    None
 }
 
 pub fn set_config_path_value(cfg: &mut AppConfig, dotted_path: &str, value: &str) -> Result<()> {
@@ -202,4 +293,48 @@ pub fn set_config_path_value(cfg: &mut AppConfig, dotted_path: &str, value: &str
 
     *cfg = serde_json::from_value(root).context("failed rebuilding typed config after set")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_workspace_binding_rewrites_legacy_openclaw_workspace() {
+        let normalized = normalize_workspace_binding(
+            "/Users/keszeyd/.openclaw/workspace/automation/secrella",
+            "/Users/keszeyd/work",
+        );
+        assert_eq!(normalized, "/Users/keszeyd/work/automation/secrella");
+    }
+
+    #[test]
+    fn migrate_legacy_openclaw_workspace_bindings_updates_agent_workspace_and_soul() {
+        let mut cfg = AppConfig::default();
+        cfg.brain.workspace = "/Users/keszeyd/work".to_string();
+        cfg.agents.push(AgentConfig {
+            id: "secrella_1".to_string(),
+            name: "secrella_1".to_string(),
+            soul: "Workspace: /Users/keszeyd/.openclaw/workspace/automation/secrella".to_string(),
+            workspace: Some("/Users/keszeyd/.openclaw/workspace/automation/secrella".to_string()),
+        });
+
+        let changed = migrate_legacy_openclaw_workspace_bindings(&mut cfg);
+        assert!(changed);
+
+        let migrated = cfg
+            .agents
+            .iter()
+            .find(|agent| agent.id == "secrella_1")
+            .expect("expected migrated agent");
+        assert_eq!(
+            migrated.workspace.as_deref(),
+            Some("/Users/keszeyd/work/automation/secrella")
+        );
+        assert!(
+            migrated
+                .soul
+                .contains("/Users/keszeyd/work/automation/secrella")
+        );
+    }
 }
