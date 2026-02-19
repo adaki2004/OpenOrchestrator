@@ -119,6 +119,12 @@ cargo run -- config set brain.model '"gpt-5"'
 cargo run -- config set gateway.port 4001
 ```
 
+If you want to bypass sandbox mode then use `OPENORCHESTRATOR_CODEX_BYPASS_SANDBOX` flag.
+
+```bash
+OPENORCHESTRATOR_CODEX_BYPASS_SANDBOX=1 cargo run -- --config YOUR_PATH_TO_CONFIG/openorchestrator.json gateway run
+```
+
 ## Project docs
 
 - PRD: `docs/PRD.md`
