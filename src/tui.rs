@@ -27,7 +27,8 @@ pub async fn run_tui(
     session_override: Option<String>,
     agent_override: Option<String>,
 ) -> Result<()> {
-    let base_url = gateway_url.unwrap_or_else(|| format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port));
+    let base_url =
+        gateway_url.unwrap_or_else(|| format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port));
     let api_url = format!("{}/api/chat", base_url.trim_end_matches('/'));
 
     let client = Client::builder()
@@ -71,7 +72,9 @@ pub async fn run_tui(
             println!("  /agent <id>        switch active agent");
             println!("  /who               show active context");
             println!("  /exit              quit tui");
-            println!("\nEverything else is sent to OpenOrchestrator (including /task, /spawn, /remember, etc).");
+            println!(
+                "\nEverything else is sent to OpenOrchestrator (including /task, /spawn, /remember, etc)."
+            );
             continue;
         }
 
@@ -114,7 +117,10 @@ pub async fn run_tui(
             .with_context(|| format!("failed sending request to {}", api_url))?;
 
         if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_else(|_| "<no body>".to_string());
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<no body>".to_string());
             println!("gateway error: {}", body);
             continue;
         }

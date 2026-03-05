@@ -11,6 +11,12 @@ use tokio::sync::RwLock;
 use tracing::{error, info};
 use uuid::Uuid;
 
+const MAX_PROMPT_USER_CHARS: usize = 4_000;
+const MAX_PROMPT_HISTORY_ITEM_CHARS: usize = 1_000;
+const MAX_PROMPT_HISTORY_TOTAL_CHARS: usize = 8_000;
+const MAX_PROMPT_MEMORY_ITEM_CHARS: usize = 700;
+const MAX_PROMPT_MEMORY_TOTAL_CHARS: usize = 4_000;
+
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
     pub source: String,
@@ -425,8 +431,14 @@ impl Orchestrator {
         match response {
             Ok(answer) => Ok(answer),
             Err(err) => {
-                error!(agent_id = %agent.id, error = %err, "codex run error");
-                Ok(format!("[openorchestrator error] {}", err))
+                let error_chain = format!("{err:#}");
+                error!(
+                    agent_id = %agent.id,
+                    session = %session,
+                    error = %error_chain,
+                    "codex run error"
+                );
+                Ok(format!("[openorchestrator error] {}", error_chain))
             }
         }
     }
@@ -460,20 +472,33 @@ fn build_prompt(
     long_tail: &[String],
     open_tasks: &[TaskItem],
 ) -> String {
+    let user_text = truncate_for_prompt(user_text, MAX_PROMPT_USER_CHARS);
     let history_text = if history.is_empty() {
         "(none)".to_string()
     } else {
-        history
+        let joined = history
             .iter()
-            .map(|item| format!("{}: {}", item.role, item.text))
+            .map(|item| {
+                format!(
+                    "{}: {}",
+                    item.role,
+                    truncate_for_prompt(&item.text, MAX_PROMPT_HISTORY_ITEM_CHARS)
+                )
+            })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        truncate_for_prompt(&joined, MAX_PROMPT_HISTORY_TOTAL_CHARS)
     };
 
     let memory_text = if long_tail.is_empty() {
         "(none)".to_string()
     } else {
-        long_tail.join("\n")
+        let joined = long_tail
+            .iter()
+            .map(|value| truncate_for_prompt(value, MAX_PROMPT_MEMORY_ITEM_CHARS))
+            .collect::<Vec<_>>()
+            .join("\n");
+        truncate_for_prompt(&joined, MAX_PROMPT_MEMORY_TOTAL_CHARS)
     };
 
     let tasks_text = if open_tasks.is_empty() {
@@ -502,6 +527,7 @@ Soul:\n{soul}\n\
 - Be concise and operational.\n\
 - Prefer concrete next actions.\n\
 - If user asks for automation, include a clear checklist.\n\
+- When stopping processes, avoid broad kill patterns; identify exact target PIDs and exclude your current shell process.\n\
 \nLong-tail memory matches:\n{memory}\n\
 \nOpen tasks:\n{tasks}\n\
 \nRecent session history:\n{history}\n\
@@ -513,6 +539,21 @@ Soul:\n{soul}\n\
         history = history_text,
         message = user_text,
     )
+}
+
+fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut chars = value.chars();
+    let kept = chars.by_ref().take(max_chars).collect::<String>();
+    let remaining = chars.count();
+    if remaining == 0 {
+        value.to_string()
+    } else {
+        format!("{kept}\n...[truncated {remaining} chars]")
+    }
 }
 
 fn format_status(status: &TaskStatus) -> &'static str {
@@ -573,6 +614,9 @@ fn parse_inline_spawn_request(raw: &str) -> Option<InlineSpawnRequest> {
     let trimmed = raw.trim();
     let first_space = trimmed.find(char::is_whitespace)?;
     let (candidate_agent_id, remaining) = trimmed.split_at(first_space);
+    if !is_explicit_inline_spawn_target(candidate_agent_id) {
+        return None;
+    }
     let agent_id = normalize_agent_id(candidate_agent_id);
     if !is_valid_agent_id(&agent_id) {
         return None;
@@ -598,6 +642,22 @@ fn parse_inline_spawn_request(raw: &str) -> Option<InlineSpawnRequest> {
         agent_id,
         workspace,
     })
+}
+
+fn is_explicit_inline_spawn_target(raw_candidate: &str) -> bool {
+    let trimmed = raw_candidate.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.starts_with('@') {
+        return true;
+    }
+
+    let normalized = normalize_agent_id(trimmed);
+    normalized
+        .chars()
+        .any(|ch| ch == '_' || ch == '-' || ch.is_ascii_digit())
 }
 
 fn extract_workspace_path(raw: &str) -> Option<String> {
@@ -702,6 +762,16 @@ mod tests {
         assert!(
             parse_inline_spawn_request("openclawd_1 please spawn a new agent for automation")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_inline_spawn_request_rejects_generic_polite_prompt() {
+        assert!(
+            parse_inline_spawn_request(
+                "please spawn a new agent that analyzes scripts in /Users/keszeyd/work/automation/secrella"
+            )
+            .is_none()
         );
     }
 

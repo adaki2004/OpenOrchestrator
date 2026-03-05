@@ -116,14 +116,21 @@ impl StateStore {
             guard.next_id += 1;
             guard.conversations.push(item);
             if guard.conversations.len() > self.max_conversation_items {
-                let drop_count = guard.conversations.len().saturating_sub(self.max_conversation_items);
+                let drop_count = guard
+                    .conversations
+                    .len()
+                    .saturating_sub(self.max_conversation_items);
                 guard.conversations.drain(0..drop_count);
             }
         }
         self.save().await
     }
 
-    pub async fn add_memory(&self, source: impl Into<String>, text: impl Into<String>) -> Result<MemoryItem> {
+    pub async fn add_memory(
+        &self,
+        source: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<MemoryItem> {
         let memory = {
             let mut guard = self.inner.write().await;
             let item = MemoryItem {
@@ -161,7 +168,10 @@ impl StateStore {
 
     pub async fn search_long_tail(&self, query: &str, limit: usize) -> Vec<String> {
         let q = query.to_lowercase();
-        let terms: Vec<&str> = q.split_whitespace().filter(|part| !part.is_empty()).collect();
+        let terms: Vec<&str> = q
+            .split_whitespace()
+            .filter(|part| !part.is_empty())
+            .collect();
         if terms.is_empty() {
             return Vec::new();
         }
@@ -171,15 +181,24 @@ impl StateStore {
 
         for memory in &guard.memories {
             let candidate = memory.text.to_lowercase();
-            let score = terms.iter().filter(|term| candidate.contains(**term)).count();
+            let score = terms
+                .iter()
+                .filter(|term| candidate.contains(**term))
+                .count();
             if score > 0 {
-                scored.push((score, format!("memory#{} [{}] {}", memory.id, memory.source, memory.text)));
+                scored.push((
+                    score,
+                    format!("memory#{} [{}] {}", memory.id, memory.source, memory.text),
+                ));
             }
         }
 
         for convo in &guard.conversations {
             let candidate = convo.text.to_lowercase();
-            let score = terms.iter().filter(|term| candidate.contains(**term)).count();
+            let score = terms
+                .iter()
+                .filter(|term| candidate.contains(**term))
+                .count();
             if score > 0 {
                 scored.push((
                     score,
@@ -199,7 +218,11 @@ impl StateStore {
             .collect()
     }
 
-    pub async fn add_task(&self, title: impl Into<String>, owner_agent: impl Into<String>) -> Result<TaskItem> {
+    pub async fn add_task(
+        &self,
+        title: impl Into<String>,
+        owner_agent: impl Into<String>,
+    ) -> Result<TaskItem> {
         let task = {
             let mut guard = self.inner.write().await;
             let now = Utc::now();
