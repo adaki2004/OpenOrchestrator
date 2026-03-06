@@ -423,16 +423,43 @@ async fn process_slack_event(state: GatewayState, payload: Value) -> Result<()> 
         return Ok(());
     }
 
-    let reply = state
+    let reply = match state
         .orchestrator
         .handle_message(IncomingMessage {
             source: "slack".to_string(),
             user,
-            session: Some(session),
+            session: Some(session.clone()),
             agent_id: None,
             text: cleaned_text,
         })
-        .await?;
+        .await
+    {
+        Ok(reply) => reply,
+        Err(err) => {
+            let error_text = format!("[openorchestrator error] {}", err);
+            error!(
+                channel = %channel,
+                session = %session,
+                error = %err,
+                "failed processing Slack message"
+            );
+            if let Some(token) = state.slack.bot_token.as_deref() {
+                if let Err(send_err) = send_slack_message(
+                    &state.http_client,
+                    token,
+                    &channel,
+                    &error_text,
+                    thread_ts.as_deref(),
+                    state.slack.default_channel.as_deref(),
+                )
+                .await
+                {
+                    warn!(error = %send_err, "failed sending Slack error message");
+                }
+            }
+            return Ok(());
+        }
+    };
 
     if let Some(token) = state.slack.bot_token.as_deref() {
         send_slack_message(
