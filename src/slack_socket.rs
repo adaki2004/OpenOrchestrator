@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Interval, interval, sleep_until, timeout};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+const PING_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const PONG_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 

@@ -4,7 +4,7 @@ Installed on `alpha-1` (`194.35.12.128`) on 2026-10-16. The gateway remains priv
 
 ## Recovery layers
 
-The gateway sends a WebSocket ping immediately after connecting and every 30 seconds thereafter. It requires the matching pong within 15 seconds. A silent connection is dropped and the existing reconnect loop obtains a fresh Slack URL after three seconds. Handshakes have a 20-second deadline; ACK, ping/pong writes, and close have 10-second deadlines. Reconnecting the socket leaves ongoing model work in the gateway running.
+The gateway sends a WebSocket ping immediately after connecting and every six hours thereafter, as requested by the operator. It requires the matching pong within 15 seconds. A silent connection is dropped and the existing reconnect loop obtains a fresh Slack URL after three seconds. Handshakes have a 20-second deadline; ACK, ping/pong writes, and close have 10-second deadlines. Reconnecting the socket leaves ongoing model work in the gateway running. Socket health accepts the last verified pong for the six-hour interval plus the response/write deadlines. A silent failure can therefore remain undetected for up to approximately six hours.
 
 Previously, `reader.next()` could wait forever on a silently dead connection while `/health` continued reporting OK. Slack's SDKs also use ping/pong deadlines to detect this condition: [Slack SocketModeOptions](https://docs.slack.dev/tools/node-slack-sdk/reference/socket-mode/interfaces/SocketModeOptions/).
 
