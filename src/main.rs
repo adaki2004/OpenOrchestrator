@@ -3,6 +3,7 @@ mod config;
 mod gateway;
 mod onboarding;
 mod orchestrator;
+mod slack_socket;
 mod state;
 mod tui;
 

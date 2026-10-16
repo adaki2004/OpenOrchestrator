@@ -1,5 +1,6 @@
 use crate::config::{SlackMode, normalize_workspace_binding, resolve_path};
 use crate::orchestrator::{IncomingMessage, Orchestrator};
+use crate::slack_socket::{HealthSnapshot, MonitoredSocket, SocketHealth};
 use crate::state::TaskItem;
 use anyhow::{Context, Result, bail};
 use axum::Router;
@@ -9,7 +10,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,7 @@ struct GatewayState {
     started_at: Instant,
     http_client: Client,
     slack: SlackRuntime,
+    socket_health: SocketHealth,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +84,7 @@ struct HealthResponse {
     status: &'static str,
     uptime_seconds: u64,
     slack_enabled: bool,
+    slack_socket: Option<HealthSnapshot>,
 }
 
 pub async fn run_gateway(
@@ -131,6 +133,7 @@ pub async fn run_gateway(
         started_at: Instant::now(),
         http_client,
         slack: slack_runtime,
+        socket_health: SocketHealth::default(),
     };
 
     let app = build_router(state.clone());
@@ -174,6 +177,8 @@ async fn health(State(state): State<GatewayState>) -> impl IntoResponse {
         status: "ok",
         uptime_seconds: state.started_at.elapsed().as_secs(),
         slack_enabled: state.slack.enabled,
+        slack_socket: (state.slack.enabled && state.slack.mode == SlackMode::Socket)
+            .then(|| state.socket_health.snapshot()),
     };
     (StatusCode::OK, axum::Json(payload))
 }
@@ -1151,20 +1156,15 @@ async fn run_slack_socket_connection(state: GatewayState) -> Result<()> {
         .context("slack.app_token is missing for socket mode")?;
 
     let socket_url = fetch_slack_socket_url(&state.http_client, app_token).await?;
-    let (ws_stream, _response) = connect_async(socket_url.as_str())
-        .await
-        .context("failed connecting Slack socket websocket")?;
+    let (ws_stream, _response) =
+        tokio::time::timeout(Duration::from_secs(20), connect_async(socket_url.as_str()))
+            .await
+            .context("Slack socket connection timed out")?
+            .context("failed connecting Slack socket websocket")?;
     info!("Slack socket mode connected");
 
-    let (mut writer, mut reader) = ws_stream.split();
-    while let Some(next_message) = reader.next().await {
-        let message = match next_message {
-            Ok(message) => message,
-            Err(err) => {
-                return Err(err).context("slack socket receive error");
-            }
-        };
-
+    let mut socket = MonitoredSocket::new(ws_stream, state.socket_health.clone());
+    while let Some(message) = socket.next().await? {
         match message {
             Message::Text(text) => {
                 let payload: Value = match serde_json::from_str(text.as_ref()) {
@@ -1177,7 +1177,7 @@ async fn run_slack_socket_connection(state: GatewayState) -> Result<()> {
 
                 if let Some(envelope_id) = payload.get("envelope_id").and_then(Value::as_str) {
                     let ack = json!({"envelope_id": envelope_id}).to_string();
-                    writer
+                    socket
                         .send(Message::Text(ack.into()))
                         .await
                         .context("failed sending Slack socket ack")?;
@@ -1197,12 +1197,6 @@ async fn run_slack_socket_connection(state: GatewayState) -> Result<()> {
                     break;
                 }
             }
-            Message::Ping(payload) => {
-                writer
-                    .send(Message::Pong(payload))
-                    .await
-                    .context("failed sending Slack socket pong")?;
-            }
             Message::Close(frame) => {
                 info!(?frame, "Slack socket closed");
                 break;
@@ -1212,6 +1206,7 @@ async fn run_slack_socket_connection(state: GatewayState) -> Result<()> {
         }
     }
 
+    socket.close().await;
     Ok(())
 }
 
@@ -1401,6 +1396,7 @@ mod tests {
             started_at: Instant::now(),
             http_client,
             slack,
+            socket_health: SocketHealth::default(),
         });
 
         (router, base_dir)
