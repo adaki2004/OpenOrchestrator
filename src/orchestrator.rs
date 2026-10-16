@@ -579,6 +579,10 @@ fn normalize_agent_id(value: &str) -> String {
 }
 
 fn parse_inline_delegate_request(raw: &str) -> Option<InlineDelegateRequest> {
+    parse_agent_run_delegate_request(raw).or_else(|| parse_natural_language_delegate_request(raw))
+}
+
+fn parse_agent_run_delegate_request(raw: &str) -> Option<InlineDelegateRequest> {
     let trimmed = raw.trim();
     let first_space = trimmed.find(char::is_whitespace)?;
     let (candidate_agent_id, remaining) = trimmed.split_at(first_space);
@@ -602,6 +606,61 @@ fn parse_inline_delegate_request(raw: &str) -> Option<InlineDelegateRequest> {
         agent_id,
         task: task.to_string(),
     })
+}
+
+fn parse_natural_language_delegate_request(raw: &str) -> Option<InlineDelegateRequest> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    for prefix in [
+        "please task the ",
+        "task the ",
+        "please task ",
+        "task ",
+        "please delegate to ",
+        "delegate to ",
+    ] {
+        if !lowered.starts_with(prefix) {
+            continue;
+        }
+
+        let rest = trimmed[prefix.len()..].trim_start();
+        if let Some(parsed) = parse_agent_to_task(rest) {
+            return Some(parsed);
+        }
+    }
+
+    None
+}
+
+fn parse_agent_to_task(raw: &str) -> Option<InlineDelegateRequest> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    for separator in [" agent to ", " to "] {
+        let Some(idx) = lowered.find(separator) else {
+            continue;
+        };
+        let candidate_agent_id = trimmed[..idx].trim();
+        let task = trimmed[idx + separator.len()..].trim();
+        let agent_id = normalize_agent_id(candidate_agent_id);
+        if !is_valid_agent_id(&agent_id) || task.is_empty() {
+            return None;
+        }
+
+        return Some(InlineDelegateRequest {
+            agent_id,
+            task: task.to_string(),
+        });
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -739,9 +798,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_inline_delegate_request_accepts_task_the_agent_phrase() {
+        let parsed = parse_inline_delegate_request(
+            "please task the contract_analyst agent to analyze the attached contract",
+        )
+        .expect("expected natural-language delegate request");
+        assert_eq!(parsed.agent_id, "contract_analyst");
+        assert_eq!(parsed.task, "analyze the attached contract");
+    }
+
+    #[test]
+    fn parse_inline_delegate_request_accepts_task_agent_to_phrase() {
+        let parsed = parse_inline_delegate_request("Task contract_analyst to create the workbook")
+            .expect("expected natural-language delegate request");
+        assert_eq!(parsed.agent_id, "contract_analyst");
+        assert_eq!(parsed.task, "create the workbook");
+    }
+
+    #[test]
     fn parse_inline_delegate_request_rejects_non_delegate_messages() {
         assert!(parse_inline_delegate_request("openclawd_1 run").is_none());
         assert!(parse_inline_delegate_request("openclawd_1 build posting-hours").is_none());
+        assert!(parse_inline_delegate_request("task the analyst agent").is_none());
     }
 
     #[test]

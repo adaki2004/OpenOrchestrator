@@ -7,6 +7,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+const DEFAULT_CODEX_TIMEOUT_SECS: u64 = 3600;
+
 #[derive(Clone, Debug)]
 pub struct CodexRunner {
     timeout: Duration,
@@ -15,7 +17,7 @@ pub struct CodexRunner {
 impl Default for CodexRunner {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(600),
+            timeout: codex_timeout(),
         }
     }
 }
@@ -124,4 +126,13 @@ fn bypass_codex_sandbox() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn codex_timeout() -> Duration {
+    let secs = std::env::var("OPENORCHESTRATOR_CODEX_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CODEX_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
